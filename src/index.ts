@@ -1,7 +1,6 @@
 // =======================
 // Imports and Setup
 // =======================
-// Import required libraries and modules for AI, text splitting, workflows, file handling, and web server.
 import type { TextBlock } from '@anthropic-ai/sdk/resources';
 import Anthropic from '@anthropic-ai/sdk';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
@@ -9,24 +8,28 @@ import { WorkflowEntrypoint, WorkflowEvent, WorkflowStep } from 'cloudflare:work
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { methodOverride } from 'hono/method-override';
-import {
-  createToolsFromOpenAPISpec,
-  runWithTools,
-  autoTrimTools,
-} from "@cloudflare/ai-utils";
 import mammoth from 'mammoth';
 import * as XLSX from 'xlsx';
-import { Agent, AgentNamespace } from "agents";
+import { Agent } from "agents";
 import { createWorkersAI } from 'workers-ai-provider';
 
+// =======================
+// Agent for Background Processing
+// =======================
 export class MyAgent extends Agent {
-  // Define methods on the Agent:
-  // https://developers.cloudflare.com/agents/api-reference/agents-api/
-  //
-  // Every Agent has built in state via this.setState and this.sql
-  // Built-in scheduling via this.schedule
-  // Agents support WebSockets, HTTP requests, state synchronization and
-  // can run for seconds, minutes or hours: as long as the tasks need.
+  async run(event: WorkflowEvent<any>, step: WorkflowStep) {
+    if (event.name === "reindex-doc") {
+      const { filename, uploader } = event.payload;
+      const fileObj = await this.env.R2.get(filename);
+      if (!fileObj) {
+        console.error("File not found in R2 for reindexing:", filename);
+        return;
+      }
+      // Create a File-like object for processDocument
+      const file = new File([await fileObj.arrayBuffer()], filename, { type: fileObj.httpMetadata?.contentType || "application/octet-stream" });
+      await processDocument(file, this.env, uploader);
+    }
+  }
 }
 
 // =======================
@@ -373,7 +376,7 @@ const ALLOWED_FILE_TYPES = [
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   'application/vnd.ms-excel',
   'text/csv',
-  'application/pdf' // <-- Added PDF support
+  'application/pdf'
 ];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 const UPLOAD_AUTH_KEY = 'your-secure-upload-key';
@@ -388,27 +391,19 @@ const UPLOAD_AUTH_KEY = 'your-secure-upload-key';
 async function extractTextFromFile(file: File): Promise<string> {
   const fileType = file.type;
   const arrayBuffer = await file.arrayBuffer();
-
-  // PDF using pdfjs-dist (not supported in Workers, so fallback)
   if (fileType === 'application/pdf') {
-    // PDF parsing not supported in Cloudflare Workers, return fallback message
     return "PDF parsing is not supported in this environment.";
-  }
-  // DOCX and DOC using mammoth
-  else if (
+  } else if (
     fileType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
     fileType === 'application/msword'
   ) {
     try {
       const { value } = await mammoth.convertToHtml({ arrayBuffer });
-      // Strip HTML tags for plain text
       return value.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
     } catch (e) {
       return "Failed to extract text from Word document.";
     }
-  }
-  // XLSX and XLS using XLSX
-  else if (
+  } else if (
     fileType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
     fileType === 'application/vnd.ms-excel'
   ) {
@@ -424,23 +419,17 @@ async function extractTextFromFile(file: File): Promise<string> {
     } catch (e) {
       return "Failed to extract text from Excel document.";
     }
-  }
-  // CSV
-  else if (fileType === 'text/csv') {
+  } else if (fileType === 'text/csv') {
     const csvText = new TextDecoder().decode(new Uint8Array(arrayBuffer));
     return csvText.split("\n")
       .map(row => row.split(",").map(cell => cell.trim()).join(" "))
       .join("\n");
-  }
-  // PPTX and PPT (placeholder, real parsing not implemented)
-  else if (
+  } else if (
     fileType === 'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
     fileType === 'application/vnd.ms-powerpoint'
   ) {
     return "PPT and PPTX parsing is not supported in this environment.";
-  }
-  // Fallback: treat as plain text
-  else {
+  } else {
     return new TextDecoder().decode(new Uint8Array(arrayBuffer));
   }
 }
@@ -452,51 +441,37 @@ async function extractTextFromFile(file: File): Promise<string> {
 // Document Processing
 // =======================
 // Process document: extract text, split into chunks, and store embeddings
-async function processDocument(file: File, env: Env): Promise<number> {
+async function processDocument(file: File, env: Env, uploader: string = "anonymous"): Promise<number> {
+  const now = new Date().toISOString();
   const fullText = await extractTextFromFile(file);
-  console.log("Extracted full text length:", fullText.length);
-
   const splitter = new RecursiveCharacterTextSplitter({
     chunkSize: 200,
     chunkOverlap: 50,
   });
   const documents = await splitter.createDocuments([fullText]);
   const chunks = documents.map(doc => doc.pageContent);
-  console.log("Split document into", chunks.length, "chunks");
 
   let totalInserted = 0;
   for (const [index, chunk] of chunks.entries()) {
     const aiResponse = await env.AI.run('@cf/baai/bge-base-en-v1.5', { text: chunk });
     const embedding = aiResponse.data[0];
-    if (!embedding) {
-      console.error(`Embedding generation failed for chunk ${index}`);
-      continue;
-    }
+    if (!embedding) continue;
     const vectorId = `doc-${Date.now()}-${index}`;
-    if (!env.VECTOR_INDEX) {
-      console.warn("VECTOR_INDEX is not defined; using mock vector index for local testing.");
-      env.VECTOR_INDEX = {
-        describe: async () => ({
-          id: "mock-id",
-          name: "mock-index",
-          dimensions: 768,
-          config: { dimensions: 768, metric: "cosine", shardCount: 1 },
-          vectorsCount: 0,
-        }),
-        insert: async (vectors) => ({ ids: vectors.map((_, i) => `mock-id-${i}`), count: vectors.length }),
-        deleteByIds: async (ids) => ({ ids, count: ids.length }),
-        getByIds: async (ids) => ids.map(id => ({ id, values: new Array(768).fill(0) })),
-        query: async (vectors, options) => ({
-          matches: [{ id: "mock-id", score: 0.9 }],
-          count: 1,
-        }),
-        upsert: async (vectors) => {
-          console.log("Upserted vectors:", vectors);
-          return { ids: vectors.map((_, i) => `mock-id-${i}`), count: vectors.length };
-        },
-      };
-    }
-    await env.VECTOR_INDEX.upsert([{ id: vectorId, values: embedding }]);
+    await env.VECTOR_INDEX.upsert([
+      {
+        id: vectorId,
+        values: embedding,
+        metadata: {
+          text: chunk,
+          docId: file.name,
+          chunkId: vectorId,
+          chunkPreview: chunk.slice(0, 80),
+          filename: file.name,
+          uploaded_at: now,
+          uploader
+        }
+      }
+    ]);
     totalInserted++;
   }
   return totalInserted;
@@ -526,50 +501,71 @@ app.post("/questions", async (c) => {
   try {
     body = await c.req.json();
   } catch (err) {
-    console.error("Invalid JSON payload:", err);
     return c.json({ success: false, message: "Invalid JSON payload" }, 400);
   }
   const { question, answer } = body;
   if (!question || !answer || typeof question !== "string" || typeof answer !== "string") {
-    console.error("Missing or invalid fields:", body);
     return c.json({ success: false, message: "Missing or invalid fields" }, 400);
   }
   const sanitizedQuestion = question.trim();
   const sanitizedAnswer = answer.trim();
 
   try {
+    // Deduplication: Vector similarity check
+    const embeddingResult = await c.env.AI.run('@cf/baai/bge-base-en-v1.5', { text: sanitizedQuestion });
+    const embedding = embeddingResult.data?.[0];
+    if (!embedding || embedding.length === 0) {
+      return c.json({ success: false, message: 'Failed to generate embedding' }, 400);
+    }
+    // Query for similar questions (top 3)
+    const vectorResult = await c.env.VECTOR_INDEX.query([embedding], { topK: 3 });
+    const vectorSearchMatches = vectorResult.matches || [];
+    // Confidence-based fallback
+    const bestMatch = vectorSearchMatches[0];
+    if (bestMatch?.score < 0.75) {
+      return c.html(`<p>I’m not confident I can answer that accurately based on the available information. Please upload more related documents or rephrase your question.</p>`);
+    }
+
+    // Traditional deduplication
     const checkQuery = "SELECT * FROM questions WHERE question = ? AND answer = ? LIMIT 1";
     const { results: existing } = await c.env.DATABASE.prepare(checkQuery)
       .bind(sanitizedQuestion, sanitizedAnswer)
       .all() as { results: QA_Pair[] };
-
     if (existing.length > 0) {
-      console.log("Duplicate Q&A pair found:", existing[0]);
       return c.json({ success: false, message: "A similar question and answer pair is already stored in the database." }, 409);
     }
 
-    const query = "INSERT INTO questions (question, answer) VALUES (?, ?) RETURNING id";
+    // Insert with metadata
+    const now = new Date().toISOString();
+    const uploader = c.req.header("X-User") || "anonymous";
+    const query = "INSERT INTO questions (question, answer, created_at, uploader) VALUES (?, ?, ?, ?) RETURNING id";
     const { results } = await c.env.DATABASE.prepare(query)
-      .bind(sanitizedQuestion, sanitizedAnswer)
+      .bind(sanitizedQuestion, sanitizedAnswer, now, uploader)
       .run() as { results: { id: string }[] };
     const recordId = results[0].id as string;
 
-    const embeddings = await c.env.AI.run('@cf/baai/bge-base-en-v1.5', { text: sanitizedQuestion });
-    await (c.env.VECTOR_INDEX ?? (() => { throw new Error("VECTOR_INDEX is not defined."); })()).insert([
-      { id: recordId.toString(), values: embeddings.data[0] },
+    await c.env.VECTOR_INDEX.insert([
+      {
+        id: recordId.toString(),
+        values: embedding,
+        metadata: {
+          text: `Q: ${sanitizedQuestion}\nA: ${sanitizedAnswer}`,
+          question: sanitizedQuestion,
+          answer: sanitizedAnswer,
+          created_at: now,
+          uploader
+        }
+      }
     ]);
-    console.log("Question and answer saved successfully");
     return c.json({ success: true, message: "Question and answer saved successfully!" }, 201);
   } catch (error) {
-    console.error("Database error:", error);
     return c.json({ success: false, message: "An error occurred while saving the question and answer" }, 500);
   }
 });
 
-// POST "/" - Process a question via the AI service
+// POST "/" - Main chat endpoint with confidence fallback, citation, and strict prompt
 app.post("/", async (c) => {
   let body: { question: string };
-
   const contentType = c.req.header("Content-Type") || "";
   try {
     if (contentType.includes("application/json")) {
@@ -581,150 +577,113 @@ app.post("/", async (c) => {
       return c.text("Unsupported Content-Type", 400);
     }
   } catch (err) {
-    console.error("Invalid payload:", err);
     return c.text("Invalid payload", 400);
   }
-
   if (!body.question || typeof body.question !== "string") {
-    console.error("Missing or invalid 'question' field:", body);
     return c.text("Missing or invalid 'question' field", 400);
   }
 
-  // Detect if the user is asking about a website's front page
-  const websiteMatch = body.question.match(/(?:what('|’)s|what is|show|summarize|describe|rewrite|reword|paraphrase)[^\.!?]*front page of ([\w.-]+\.[a-z]{2,})/i);
-  let websiteContext = "";
-  if (websiteMatch) {
-    let url = websiteMatch[2];
-    if (!/^https?:\/\//i.test(url)) url = "https://" + url;
-    try {
-      // Use enhanced extraction: text, tables, images, no length limit
-      const title = "Unavailable";
-      const content = "Content extraction is not supported in this environment.";
-      websiteContext = `Webpage "${title}" (${url}):\n${content}`;
-    } catch (err) {
-      websiteContext = "Failed to fetch or render the website.";
-    }
-  }
-
-  // --- Vector search and citation logic ---
+  // Vector search and citation logic
   let citationInfo: string | null = null;
   let vectorSearchMatches: any[] = [];
+  let contextChunks: string[] = [];
+  let bestMatch: any = null;
 
   if (c.env.VECTOR_INDEX && body.question) {
     try {
-      // Generate embedding for the question
       const embeddingResult = await c.env.AI.run('@cf/baai/bge-base-en-v1.5', { text: body.question });
       const embedding = embeddingResult.data?.[0];
-
       if (!embedding || embedding.length === 0) {
         return c.json({ success: false, message: 'Failed to generate embedding' }, 400);
       }
-
-      // Query the vector index for similar documents
-      const vectorResult = await c.env.VECTOR_INDEX.query(embedding, { topK: 1 });
+      const vectorResult = await c.env.VECTOR_INDEX.query([embedding], { topK: 3 });
       vectorSearchMatches = vectorResult.matches || [];
-
-      if (vectorSearchMatches.length > 0) {
-        // Assume the match id is the document id or filename
-        const docId = vectorSearchMatches[0].id;
-        // You may want to fetch more metadata from R2 or your DB here
-        // Retrieve object metadata from R2
-        const r2Object = await c.env.R2.head(docId);
-        if (r2Object) {
-          const fullDocName = r2Object.key; // The object's key represents its full name
-          citationInfo = `Response generated using content from document: <b>${fullDocName}</b>`;
-        } else {
-          citationInfo = `Response generated using content from document: <b>${docId}</b>`;
+      bestMatch = vectorSearchMatches[0];
+      // Confidence-based fallback
+      if (!bestMatch || bestMatch.score < 0.75) {
+        return c.html(`<p>I’m not confident I can answer that accurately based on the available information. Please upload more related documents or rephrase your question.</p>`);
+      }
+      // Build context from top matches
+      for (const match of vectorSearchMatches) {
+        if (match.metadata && match.metadata.text) {
+          contextChunks.push(match.metadata.text);
+        } else if (match.text) {
+          contextChunks.push(match.text);
         }
       }
+      // Enhanced citation
+      const meta = bestMatch?.metadata || {};
+      citationInfo = meta.filename
+        ? `<p>Based on document: <b>${meta.filename}</b>, section: <i>${meta.chunkPreview || ''}</i></p>`
+        : `<p>Based on document chunk: <b>${bestMatch?.id}</b></p>`;
     } catch (error) {
-      console.error('Vector search error:', error);
       return c.json({ success: false, message: 'Failed to process vector search' }, 500);
     }
   }
 
-  // === AI API Key Check ===
+  // Strict system prompt
+  let systemPrompt = `
+You are a Cloudflare RFP assistant. You must only respond using provided notes or document context.
+If context is insufficient or ambiguous, reply: "I'm not sure based on the current information."
+Avoid fabricating any information.
+`;
+
+  // Notes context as separate user message
+  const { results: notes } = await c.env.DATABASE
+    .prepare("SELECT * FROM questions WHERE question LIKE ? ORDER BY id DESC LIMIT 3")
+    .bind(`%${body.question}%`)
+    .all<QA_Pair>();
+  let notesContext = "";
+  if (notes.length > 0) {
+    notesContext = notes.map(n => `Q: ${n.question}\nA: ${n.answer}`).join("\n---\n");
+  }
+  let vectorContext = contextChunks.join("\n---\n");
+
+  // Compose messages array for LLM
+  const messages = [
+    { role: "system", content: systemPrompt },
+    ...(notesContext ? [{ role: "user", content: "Reference notes:\n" + notesContext }] : []),
+    ...(vectorContext ? [{ role: "user", content: "Relevant document context:\n" + vectorContext }] : []),
+    { role: "user", content: body.question }
+  ];
+
+  // AI API Key Check
   if (!c.env.ANTHROPIC_API_KEY && !c.env.AI) {
-    // If neither Anthropic nor Workers AI is configured, return error
     return c.text("AI service is not configured. Please check your API keys.", 500);
   }
 
   try {
     let modelUsed: string = "";
-    let systemPrompt: string = `
-    You are a helpful, super intelligent, knowledgeable Cloudflare Proposal Management assistant named Lawrence.
-    You have true understandingd and reasoning around Cloudflare's products and services.
-    You can answer questions about your own capabilities based on your backend code and features.
-
-    Do not halluncinate. If you don't know the correct answer, say "I don't know."
-    `;
-
-    let contextQuestions: string[] = [];
-    if (websiteContext) {
-      contextQuestions.push(websiteContext);
-    }
     let model = "@cf/meta/llama-4-scout-17b-16e-instruct";
     let aiStream: ReadableStream | null = null;
 
-    // 1. Search D1 for relevant notes (top 3 matches)
-    const { results: notes } = await c.env.DATABASE
-      .prepare("SELECT * FROM questions WHERE question LIKE ? ORDER BY id DESC LIMIT 3")
-      .bind(`%${body.question}%`)
-      .all<QA_Pair>();
-
-    // 2. Build context from notes
-    let notesContext = "";
-    if (notes.length > 0) {
-      notesContext = notes.map(n => `Q: ${n.question}\nA: ${n.answer}`).join("\n---\n");
-    }
-
-    // 3. Add notesContext to the system prompt or as a system message
-    systemPrompt = `
-You are a helpful, super intelligent, knowledgeable Cloudflare Proposal Management assistant named Lawrence.
-You have true understanding and reasoning around Cloudflare's products and services.
-You can answer questions about your own capabilities based on your backend code and features.
-${notesContext ? "\nHere are some relevant notes from the content library:\n" + notesContext : ""}
-
-    `;
-
     if (c.env.ANTHROPIC_API_KEY) {
-      // Anthropic streaming implementation
       const anthropic = new Anthropic({ apiKey: c.env.ANTHROPIC_API_KEY });
-      const model = "claude-3-5-sonnet-latest";
-      modelUsed = model;
-
-      // Create a streaming response from Anthropic
+      modelUsed = "claude-3-5-sonnet-latest";
       const stream = await anthropic.messages.stream({
         max_tokens: 4096,
-        model,
-        messages: [
-          { role: "user", content: body.question },
-        ],
-        system: systemPrompt,
+        model: modelUsed,
+        messages,
       });
-
-      // Compose a stream that wraps the Anthropic stream with copy buttons and formatting
       const encoder = new TextEncoder();
       const wrapperStream = new ReadableStream({
         start(controller) {
-          // Open response div
-          controller.enqueue(encoder.encode(`
-            <div id="streamed-response" style="white-space:pre-line;">`));
-
-          // Read from the Anthropic stream and forward chunks
+          controller.enqueue(encoder.encode(`<div id="streamed-response" style="white-space:pre-line;">`));
           (async () => {
             for await (const message of stream) {
               if (message.type === "content_block_delta" && 'text' in (message.delta || {})) {
                 let cleaned = message.delta.text
-                  .replace(/^\*+|\*+$/gm, '') // Remove leading/trailing *
-                  .replace(/\n{2,}/g, '<br><br>') // Paragraph breaks
-                  .replace(/\n/g, '<br>'); // Line breaks
+                  .replace(/^\*+|\*+$/gm, '')
+                  .replace(/\n{2,}/g, '<br><br>')
+                  .replace(/\n/g, '<br>');
                 controller.enqueue(encoder.encode(cleaned));
               }
             }
-
-            // Close tags and add FontAwesome copy icon button
+            let confidence = Math.round((bestMatch?.score ?? 0) * 100);
             controller.enqueue(encoder.encode(`</div>
+              <p class="result-confidence" style="background:#e7f5e6;color:#155724;padding:6px 12px;border-radius:4px;margin:10px 0 0 0;font-size:0.97em;">
+                Confidence: ${confidence}% | Source: ${bestMatch?.metadata?.filename || bestMatch?.id}
+              </p>
               ${citationInfo ? `<div style="margin-top:10px;font-size:0.95em;color:#666;">${citationInfo}</div>` : ""}
               <button onclick="copyResponseText()" title="Copy" style="background:none;border:none;cursor:pointer;margin-top:10px;">
                 <i class="fa fa-copy"></i>
@@ -746,33 +705,23 @@ ${notesContext ? "\nHere are some relevant notes from the content library:\n" + 
           })();
         }
       });
-
       return new Response(wrapperStream, {
         headers: { "Content-Type": "text/html; charset=utf-8" }
       });
     } else {
-      // Cloudflare Workers AI streaming (as you already have)
       aiStream = await c.env.AI.run(
         model,
         {
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: body.question },
-          ],
+          messages,
           max_tokens: 4096,
           stream: true
         }
       );
-
       if (aiStream) {
         const encoder = new TextEncoder();
         const wrapperStream = new ReadableStream({
           async start(controller) {
-            controller.enqueue(encoder.encode(`
-              <div id="streamed-response" style="white-space:pre-line;">`));
-            if (!aiStream) {
-              throw new Error("aiStream is null. Unable to proceed.");
-            }
+            controller.enqueue(encoder.encode(`<div id="streamed-response" style="white-space:pre-line;">`));
             const reader = aiStream.pipeThrough(new TextDecoderStream()).getReader();
             let buffer = '';
             while (true) {
@@ -794,13 +743,15 @@ ${notesContext ? "\nHere are some relevant notes from the content library:\n" + 
                         .replace(/\n/g, '<br>');
                       controller.enqueue(encoder.encode(cleaned));
                     }
-                  } catch (e) {
-                    // Ignore parse errors
-                  }
+                  } catch (e) {}
                 }
               }
             }
+            let confidence = Math.round((bestMatch?.score ?? 0) * 100);
             controller.enqueue(encoder.encode(`</div>
+              <p class="result-confidence" style="background:#e7f5e6;color:#155724;padding:6px 12px;border-radius:4px;margin:10px 0 0 0;font-size:0.97em;">
+                Confidence: ${confidence}% | Source: ${bestMatch?.metadata?.filename || bestMatch?.id}
+              </p>
               ${citationInfo ? `<div style="margin-top:10px;font-size:0.95em;color:#666;">${citationInfo}</div>` : ""}
               <i onclick="copyResponseText()" title="Copy" style="background:none;border:none;cursor:pointer;margin-top:10px;" class="fa fa-copy"></i>
               <span id="copy-message" style="display:none;margin-left:8px;color:green;font-size:0.9em;">Copied!</span>
@@ -814,7 +765,6 @@ ${notesContext ? "\nHere are some relevant notes from the content library:\n" + 
                   temp.select();
                   document.execCommand('copy');
                   document.body.removeChild(temp);
-                  // Show copied message
                   const msg = document.getElementById('copy-message');
                   if (msg) {
                     msg.style.display = 'inline';
@@ -826,7 +776,6 @@ ${notesContext ? "\nHere are some relevant notes from the content library:\n" + 
             controller.close();
           }
         });
-
         return new Response(wrapperStream, {
           headers: { "Content-Type": "text/html; charset=utf-8" }
         });
@@ -835,39 +784,37 @@ ${notesContext ? "\nHere are some relevant notes from the content library:\n" + 
       }
     }
   } catch (error) {
-    console.error("AI service error:", error);
     return c.text("An error occurred while processing your request.", 500);
   }
 });
 
-// POST "/upload" - Handle file uploads, save to R2, and process for embeddings
+// POST "/upload" - Handle file uploads, save to R2, and schedule background processing
 app.post("/upload", async (c) => {
   try {
     const formData = await c.req.parseBody();
     const file = formData?.file;
-
     if (!file) {
       return c.json({ success: false, message: "No file provided" }, 400);
     }
-
     if (!(file instanceof File) || !ALLOWED_FILE_TYPES.includes(file.type)) {
       return c.json({ success: false, message: `Unsupported file type: ${file instanceof File ? file.type : 'unknown'}` }, 400);
     }
     if (file.size > MAX_FILE_SIZE) {
       return c.json({ success: false, message: `File too large. Maximum size is ${MAX_FILE_SIZE / 1024 / 1024}MB` }, 400);
     }
-
-    // Upload the file to R2
+    const now = new Date().toISOString();
+    const uploader = c.req.header("X-User") || "anonymous";
     await c.env.R2.put(file.name, await file.arrayBuffer(), {
-      httpMetadata: { contentType: file.type }
+      httpMetadata: { contentType: file.type },
+      customMetadata: {
+        uploaded_at: now,
+        uploader,
+      }
     });
-
-    const chunksInserted = await processDocument(file, c.env);
-    console.log("Inserted", chunksInserted, "text chunks into the vector index.");
-
-    return c.json({ success: true, message: "File uploaded to R2, parsed, and processed successfully", chunks: chunksInserted });
+    // Schedule background processing
+    await MyAgent.schedule("reindex-doc", { filename: file.name, uploader });
+    return c.json({ success: true, message: "File uploaded to R2 and scheduled for processing." });
   } catch (error) {
-    console.error("File parsing error:", error);
     return c.json({ success: false, message: error instanceof Error ? error.message : "Failed to parse file" }, 400);
   }
 });
@@ -997,11 +944,11 @@ type D1Database = {
 
 type VectorizeIndex = {
   describe: () => Promise<any>;
-  insert: (vectors: { id: string; values: number[] }[]) => Promise<any>;
+  insert: (vectors: { id: string; values: number[]; metadata?: { text: string } }[]) => Promise<any>;
   deleteByIds: (ids: string[]) => Promise<any>;
   getByIds: (ids: string[]) => Promise<any>;
   query: (vectors: number[][], options: { topK: number }) => Promise<{ matches: any[]; count: number }>;
-  upsert: (vectors: { id: string; values: number[] }[]) => Promise<any>;
+  upsert: (vectors: { id: string; values: number[]; metadata?: { text: string } }[]) => Promise<any>;
 };
 
 type R2Bucket = {
@@ -1042,7 +989,7 @@ export class RAGWorkflow extends WorkflowEntrypoint<Env, Params> {
 
     if (env.ENABLE_TEXT_SPLITTING) {
       texts = await step.do("split text", async () => {
-        const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 750, chunkOverlap: 200 });
+        const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 512, chunkOverlap: 32, separators: ["\n\n", "\n", ".", " "], });
         const output = await splitter.createDocuments([text]);
         return output.map(doc => doc.pageContent);
       });
