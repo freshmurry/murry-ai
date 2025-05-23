@@ -1,0 +1,327 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
+import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
+import { WorkflowEntrypoint, WorkflowEvent, WorkflowStep } from 'cloudflare:workers';
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { methodOverride } from 'hono/method-override';
+
+// Define HTML pages as strings
+const notesHtml = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Chat | hello-ai</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
+  <script src="https://unpkg.com/mustache@latest"></script>
+  <script src="https://unpkg.com/htmx.org/dist/htmx.js"></script>
+  <script src="https://unpkg.com/htmx.org/dist/ext/client-side-templates.js"></script>
+</head>
+<body>
+  <h1>Notes</h1>
+  <p>
+    <small>
+      <button class="btn btn-default">
+        <a href="/write" style="color: black; text-decoration: none;"><i class="fa fa-plus"></i> Add to Content Library</a>
+      </button>
+      <button class="btn btn-default">
+        <a href="/notes" style="color: black; text-decoration: none;"><i class="fa fa-book"></i> Content Library</a>
+      </button>
+      <button class="btn btn-default">
+        <a href="/ui" style="color: black; text-decoration: none;"><i class="fa fa-question-circle"></i> Query</a>
+      </button>
+    </small>
+  </p>
+  <div
+    hx-ext='client-side-templates'
+    hx-get="/notes.json"
+    hx-trigger="load"
+    hx-swap="innerHTML"
+    hx-target="#notes"
+    mustache-array-template="note"
+  >
+    <template id="note">
+      {{#data}}
+        <div class="note">
+          <h2>Note #{{id}}</h2>
+          <p>{{text}}</p>
+          <form method="POST" action="/notes/{{id}}">
+            <input type="hidden" name="_method" value="DELETE">
+            <button type="submit">Delete</button>
+          </form>
+        </div>
+      {{/data}}
+    </template>
+    <div id="notes"></div>
+  </div>
+</body>
+</html>`;
+
+const uiHtml = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Chat | Cloudflare RAG Example</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
+
+   <!-- FontAwesome Icon CDN -->
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
+  <script src="https://unpkg.com/htmx.org/dist/htmx.js"></script>
+</head>
+<body>
+  <h1>hello-ai</h1>
+  <p>
+    <small>
+      <button class="btn btn-default">
+        <a href="/write" style="color: black; text-decoration: none;"><i class="fa fa-plus"></i> Add to Content Library</a>
+      </button>
+      <button class="btn btn-default">
+        <a href="/notes" style="color: black; text-decoration: none;"><i class="fa fa-book"></i> Content Library</a>
+      </button>
+      <button class="btn btn-default">
+        <a href="/ui" style="color: black; text-decoration: none;"><i class="fa fa-question-circle"></i> Query</a>
+      </button>
+    </small>
+  </p>
+  <form hx-get="/?q={{question}}" hx-trigger="submit" hx-target="#result">
+    <textarea name="question" required="true" placeholder="Ask the AI anything"></textarea>
+    <button type="submit">Submit</button>
+  </form>
+  <p id="result"></p>
+</body>
+</html>`;
+
+const writeHtml = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Write | hello-ai</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
+</head>
+<body>
+  <h1>Write a new note</h1>
+  <p>
+    <small>
+      <button class="btn btn-default">
+        <a href="/write" style="color: black; text-decoration: none;"><i class="fa fa-plus"></i> Add to Content Library</a>
+      </button>
+      <button class="btn btn-default">
+        <a href="/notes" style="color: black; text-decoration: none;"><i class="fa fa-book"></i> Content Library</a>
+      </button>
+      <button class="btn btn-default">
+        <a href="/ui" style="color: black; text-decoration: none;"><i class="fa fa-question-circle"></i> Query</a>
+      </button>
+    </small>
+  </p>
+  <form>
+    <textarea name="text" required="true" placeholder="Write a new note to add to the AI's knowledge base"></textarea>
+    <button type="submit">Submit</button>
+  </form>
+  <script>
+    const form = document.querySelector('form')
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault()
+      const text = form.querySelector('textarea').value
+      const response = await fetch('/notes', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ text })
+      })
+      if (response.ok) {
+        window.location.href = '/ui'
+      } else {
+        alert('Failed to create note')
+      }
+    })
+  </script>
+</body>
+</html>`;
+
+interface Env {
+  DATABASE: D1Database;
+  AI: any; // Replace with proper AI service type if available
+  ENABLE_TEXT_SPLITTING: boolean | undefined;
+  RAG_WORKFLOW: Workflow;
+  VECTOR_INDEX: VectorizeIndex;
+}
+
+interface Note {
+  id: string;
+  text: string;
+}
+
+interface AIMessage {
+  role: 'system' | 'user';
+  content: string;
+}
+
+interface Params {
+  text: string;
+}
+
+const app = new Hono<{ Bindings: Env }>();
+app.use(cors());
+app.use(async (c, next) => {
+  console.log('Incoming request:', c.req);
+  await next();
+});
+
+app.get('/notes.json', async (c) => {
+  const query = `SELECT * FROM notes`;
+  const { results } = await c.env.DATABASE.prepare(query).all();
+  return c.json(results);
+});
+
+app.get('/notes', async (c) => {
+  return c.html(notesHtml);
+});
+
+app.use('/notes/:id', methodOverride({ app }));
+app.delete('/notes/:id', async (c) => {
+  const { id } = c.req.param();
+  const query = `DELETE FROM notes WHERE id = ?`;
+  await c.env.DATABASE.prepare(query).bind(id).run();
+  await c.env.VECTOR_INDEX.deleteByIds([id]);
+  return c.redirect('/notes');
+});
+
+app.post('/notes', async (c) => {
+  const { text } = await c.req.json();
+  if (!text) return c.text("Missing text", 400);
+  await c.env.RAG_WORKFLOW.create({ params: { text } });
+  return c.text("Created note", 201);
+});
+
+app.get('/ui', async (c) => {
+  return c.html(uiHtml);
+});
+
+app.get('/write', async (c) => {
+  return c.html(writeHtml);
+});
+
+app.get('/', async (c) => {
+  // Get query parameter safely
+  const url = new URL(c.req.url);
+  const question = url.searchParams.get('q');
+
+  // Check if question exists
+  if (!question) {
+    return c.html(uiHtml);
+  }
+
+  // Create vector query
+  const vectorQuery = await c.env.VECTOR_INDEX.query(question, {
+    topK: 1,
+  });
+
+  let vecId;
+  if (vectorQuery.matches?.length > 0) {
+    vecId = vectorQuery.matches[0].id;
+  } else {
+    console.log("No matching vector found or vectorQuery.matches is empty");
+  }
+
+  let notes: string[] = [];
+  if (vecId) {
+    const query = `SELECT * FROM notes WHERE id = ?`;
+    const { results } = await c.env.DATABASE.prepare(query).bind(vecId).all<Note>();
+    if (results) notes = results.map(note => note.text);
+  }
+
+  const contextMessage = notes.length
+    ? `Context:\n${notes.map(note => `- ${note}`).join("\n")}`
+    : "";
+
+  const systemPrompt = `
+    You are a helpful and obedient Cloudflare proposal assistant.
+    When answering questions or responding, use the context provided, if it is provided and relevant.
+    Assist users in responding to propsoal questions using your knowledge database.
+    Always respond in a narrative and active voice.
+    Be an expert in Cloudflare products and solutions.
+    Be an expert in Government Contracting, RFI, and RFP's.
+    If there is a question that you do not know the anser to, simply tell the user that you are not trained to
+    to respond to that question yet and will be sure to provide an udate in the future.
+    
+    FORMAT:
+    Use beautiful markdown text to generate responses.
+    When necessary, use bullet points when listing a list of items.
+    When necessary, use numbers when listing a list of items.
+    When necessary, use dashes when listing a list of items.
+    Alwasys bold headings
+  `;
+
+  const model = "@cf/meta/llama-3.1-8b-instruct";
+  try {
+    const response = await c.env.AI.run(
+      model, {
+        messages: [
+          ...(notes.length ? [{ role: 'system' as const, content: contextMessage }] : []),
+          { role: 'system' as const, content: systemPrompt },
+          { role: 'user' as const, content: question },
+        ] as AIMessage[],
+      }
+    );
+
+    if (!response) {
+      throw new Error('No response from AI service');
+    }
+
+    c.header('x-model-used', model);
+    return c.json({ response });
+  } catch (error) {
+    return c.json({ error: 'AI service error' }, 500);
+  }
+});
+
+export class RAGWorkflow extends WorkflowEntrypoint<Env, Params> {
+  async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
+    const env = this.env;
+    const { text } = event.payload;
+    let texts: string[] = [text];
+
+    if (env.ENABLE_TEXT_SPLITTING) {
+      texts = await step.do('split text', async () => {
+        const splitter = new RecursiveCharacterTextSplitter({
+          chunkSize: 750,
+          chunkOverlap: 150,
+        });
+        const output = await splitter.createDocuments([text]);
+        return output.map(doc => doc.pageContent);
+      });
+      console.log(`RecursiveCharacterTextSplitter generated ${texts.length} chunks`);
+    }
+
+    for (const index in texts) {
+      const text = texts[index];
+      const record = await step.do(`create database record: ${index}/${texts.length}`, async () => {
+        const query = "INSERT INTO notes (text) VALUES (?) RETURNING *";
+
+        const { results } = await env.DATABASE.prepare(query)
+          .bind(text)
+          .run<Note>();
+
+        const record = results[0];
+        if (!record) throw new Error("Failed to create note");
+        return record;
+      });
+
+      const embedding = await step.do(`generate embedding: ${index}/${texts.length}`, async () => {
+        const embeddings = await env.AI.run('@cf/baai/bge-base-en-v1.5', { text });
+        const vectors = embeddings.data[0];
+        return vectors;
+      });
+
+      const vectorId = record.id;
+      await step.do(`upsert vector index: ${index}/${texts.length}`, async () => {
+        await env.VECTOR_INDEX.upsert(vectorId, embedding);
+      });
+    }
+    return 'done';
+  }
+}
+
+export default app;

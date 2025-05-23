@@ -1,0 +1,380 @@
+import type { TextBlock } from '@anthropic-ai/sdk/resources';
+import Anthropic from '@anthropic-ai/sdk';
+import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
+import { WorkflowEntrypoint, WorkflowEvent, WorkflowStep } from 'cloudflare:workers';
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { methodOverride } from 'hono/method-override';
+
+// Define HTML pages as strings
+const html = (question = '') => `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Chat | hello-ai</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
+  <style>
+    .btn {
+      transition: all 0.3s ease;
+      padding: 10px 20px;
+      margin: 5px;
+      cursor: pointer;
+    }
+    .btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    }
+    .btn:active {
+      transform: translateY(0);
+      box-shadow: none;
+    }
+    #add-question-modal {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0,0,0,0.5);
+      display: none;
+      justify-content: center;
+      align-items: center;
+      transition: all 0.3s ease;
+    }
+    #add-question-modal.show {
+      display: flex;
+      opacity: 1;
+    }
+    .modal-content {
+      background: white;
+      padding: 20px;
+      border-radius: 8px;
+      max-width: 80%;
+      width: 90%;
+      position: relative;
+      z-index: 1;
+    }
+    textarea {
+      transition: all 0.3s ease;
+      padding: 10px;
+      border-radius: 4px;
+      width: 100%;
+      min-height: 100px;
+      border: 1px solid #ddd;
+    }
+    textarea:focus {
+      outline: none;
+      box-shadow: 0 0 0 2px rgba(0,123,255,0.25);
+      border-color: rgba(0,123,255,0.25);
+    }
+  </style>
+  <script src="https://unpkg.com/htmx.org/dist/htmx.js"></script>
+</head>
+<body>
+  <h1>hello-ai</h1>
+  <p>
+    <small>
+      <button class="btn btn-default" id="add-question-button">
+        <a href="/write" style="color: black; text-decoration: none;"><i class="fa fa-plus"></i> Add to Content Library</a>
+      </button>
+    </small>
+  </p>
+  <form 
+    hx-post="/" 
+    hx-trigger="submit" 
+    hx-target="#result" 
+    hx-swap="innerHTML"
+    hx-headers='{"Content-Type": "application/json"}'
+  >
+    <textarea name="question" required="true" placeholder="Ask the AI anything">${question}</textarea>
+    <button type="submit" class="btn btn-primary">Submit</button>
+  </form>
+  <p id="result"></p>
+  <div id="add-question-modal" class="modal">
+    <div class="modal-content">
+      <h2>Add Question and Answer</h2>
+      <form id="add-question-form">
+        <label for="question">Question:</label>
+        <textarea id="question" name="question" required="true" placeholder="Write a question"></textarea>
+        <label for="answer">Answer:</label>
+        <textarea id="answer" name="answer" required="true" placeholder="Write an answer"></textarea>
+        <button type="submit" class="btn btn-primary">Submit</button>
+      </form>
+    </div>
+  </div>
+  <script>
+    const addQuestionButton = document.getElementById('add-question-button');
+    const addQuestionModal = document.getElementById('add-question-modal');
+    
+    addQuestionButton.addEventListener('click', (e) => {
+      e.preventDefault();
+      addQuestionModal.classList.add('show');
+    });
+    
+    window.addEventListener('click', (e) => {
+      if (e.target === addQuestionModal) {
+        addQuestionModal.classList.remove('show');
+      }
+    });
+
+    // Add active state to buttons for better feedback
+    document.querySelectorAll('.btn').forEach(button => {
+      button.addEventListener('click', () => {
+        button.classList.add('active');
+        setTimeout(() => {
+          button.classList.remove('active');
+        }, 200);
+      });
+    });
+
+    const addQuestionForm = document.getElementById('add-question-form');
+    addQuestionForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const question = document.getElementById('question').value;
+      const answer = document.getElementById('answer').value;
+      try {
+        const response = await fetch('/questions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ question, answer })
+        });
+        if (response.ok) {
+          window.location.href = '/questions';
+        } else {
+          alert('Failed to create question and answer');
+        }
+      } catch (error) {
+        console.error('Error:', error);
+        alert('An error occurred while saving the question and answer');
+      }
+    });
+
+    // Ensure the form sends JSON payload
+    document.querySelector('form[hx-post="/"]').addEventListener('submit', function (e) {
+      e.preventDefault();
+
+      const question = this.querySelector('textarea[name="question"]').value;
+      fetch('/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ question }),
+      })
+        .then(response => response.text())
+        .then(result => {
+          document.getElementById('result').innerHTML = result;
+        })
+        .catch(error => {
+          console.error('Error:', error);
+          alert('An error occurred while processing your request.');
+        });
+    });
+  </script>
+</body>
+</html>`;
+
+type Env = {
+    AI: any;
+    ANTHROPIC_API_KEY: string;
+    DATABASE: D1Database;
+    ENABLE_TEXT_SPLITTING: boolean | undefined;
+    RAG_WORKFLOW: Workflow;
+    VECTOR_INDEX?: VectorizeIndex; // Make VECTOR_INDEX optional
+};
+
+type Note = {
+    id: string;
+    text: string;
+};
+
+type Params = {
+    text: string;
+};
+
+const app = new Hono<{ Bindings: Env }>();
+app.use(cors());
+
+app.get('/', async (c) => {
+    return c.html(html());
+});
+
+app.post('/', async (c) => {
+  // Mock VECTOR_INDEX if it's not defined
+  if (!c.env.VECTOR_INDEX) {
+    console.warn("VECTOR_INDEX is not defined. Using mock data for local testing.");
+    c.env.VECTOR_INDEX = {
+      query: async (vectors, options) => {
+        console.log("Mock VECTOR_INDEX query:", vectors, options);
+        return {
+          matches: [
+            { id: "mock-id", score: 0.9 },
+          ],
+        };
+      },
+      upsert: async (vectors) => {
+        console.log("Mock VECTOR_INDEX upsert:", vectors);
+        return true;
+      },
+    };
+  }
+
+  let body: { question: string };
+  try {
+      body = await c.req.json();
+  } catch (err) {
+      console.error("Invalid JSON payload:", err);
+      return c.text("Invalid JSON payload", 400);
+  }
+
+  const { question } = body;
+  if (!question || typeof question !== 'string') {
+      console.error("Missing or invalid 'question' field:", body);
+      return c.text("Missing or invalid 'question' field", 400);
+  }
+
+  try {
+      // Generate embeddings for the question
+      const embeddings = await c.env.AI.run('@cf/baai/bge-base-en-v1.5', { text: question });
+      const vectors = embeddings.data[0];
+
+      // Query the vector index for similar questions
+      const vectorQuery = await c.env.VECTOR_INDEX.query(vectors, { topK: 3 });
+      const vecId = vectorQuery.matches[0]?.id;
+
+      let notes: string[] = [];
+      if (vecId) {
+          const query = `SELECT * FROM notes WHERE id = ?`;
+          const { results } = await c.env.DATABASE.prepare(query).bind(vecId).all<Note>();
+          if (results) notes = results.map(note => note.text);
+      }
+
+      const contextMessage = notes.length
+          ? `Context:\n${notes.map(note => `- ${note}`).join("\n")}`
+          : "";
+
+      const systemPrompt = `When answering the question or responding, use the context provided, if it is provided and relevant.`;
+
+      let modelUsed: string = "";
+      let response: any;
+
+      if (c.env.ANTHROPIC_API_KEY) {
+          const anthropic = new Anthropic({
+              apiKey: c.env.ANTHROPIC_API_KEY,
+          });
+
+          const model = "claude-3-5-sonnet-latest";
+          modelUsed = model;
+
+          const message = await anthropic.messages.create({
+              max_tokens: 1024,
+              model,
+              messages: [
+                  { role: 'user', content: question },
+              ],
+              system: [systemPrompt, notes ?? contextMessage].join(" "),
+          });
+
+          response = {
+              response: (message.content as TextBlock[]).map(content => content.text).join("\n"),
+          };
+      } else {
+          const model = "@cf/meta/llama-3.1-8b-instruct";
+          modelUsed = model;
+
+          response = await c.env.AI.run(
+              model,
+              {
+                  messages: [
+                      ...(notes.length ? [{ role: 'system', content: contextMessage }] : []),
+                      { role: 'system', content: systemPrompt },
+                      { role: 'user', content: question },
+                  ],
+              },
+          );
+      }
+
+      if (response) {
+          // Return only the AI-generated response as plain text
+          return c.text(response.response || "No response generated.");
+      } else {
+          return c.text("We were unable to generate output", 500);
+      }
+  } catch (error) {
+      console.error("AI service error:", error);
+      return c.text("An error occurred while processing your request.", 500);
+  }
+});
+
+export class RAGWorkflow extends WorkflowEntrypoint<Env, Params> {
+    async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
+        const env = this.env;
+        const { text } = event.payload;
+        let texts: string[] = [text];
+
+        if (env.ENABLE_TEXT_SPLITTING) {
+            texts = await step.do('split text', async () => {
+                const splitter = new RecursiveCharacterTextSplitter({
+                    chunkSize: 1000,
+                    chunkOverlap: 200,
+                });
+                const output = await splitter.createDocuments([text]);
+                return output.map(doc => doc.pageContent);
+            });
+
+            console.log(`RecursiveCharacterTextSplitter generated ${texts.length} chunks`);
+        }
+
+        for (const index in texts) {
+            const text = texts[index];
+            const record = await step.do(`create database record: ${index}/${texts.length}`, async () => {
+                const query = "INSERT INTO notes (text) VALUES (?) RETURNING *";
+
+                const { results } = await env.DATABASE.prepare(query)
+                    .bind(text)
+                    .run<Note>();
+
+                const record = results[0];
+                if (!record) throw new Error("Failed to create note");
+                return record;
+            });
+
+            const embedding = await step.do(`generate embedding: ${index}/${texts.length}`, async () => {
+                const embeddings = await env.AI.run('@cf/baai/bge-base-en-v1.5', { text: text });
+                const values = embeddings.data[0];
+                if (!values) throw new Error("Failed to generate vector embedding");
+                return values;
+            });
+
+            await step.do(`insert vector: ${index}/${texts.length}`, async () => {
+                if (!env.VECTOR_INDEX) {
+                    console.warn("VECTOR_INDEX is not defined. Using mock data for local testing.");
+                    env.VECTOR_INDEX = {
+                        query: async (vectors, options) => {
+                            console.log("Mock VECTOR_INDEX query:", vectors, options);
+                            return {
+                                matches: [
+                                    { id: "mock-id", score: 0.9 },
+                                ],
+                            };
+                        },
+                        upsert: async (vectors) => {
+                            console.log("Mock VECTOR_INDEX upsert:", vectors);
+                            return true;
+                        },
+                    };
+                }
+                return env.VECTOR_INDEX.upsert([
+                    {
+                        id: record.id.toString(),
+                        values: embedding,
+                    },
+                ]);
+            });
+        }
+    }
+}
+
+export default app;
